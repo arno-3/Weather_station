@@ -12,7 +12,7 @@
 
 // ---------- WiFi ----------
 const char* ssid = "dlink-6D5C";
-const char* password = "intentionally left blank ask for password";
+const char* password = "cuwqs53732";
 
 WebServer server(80);
 
@@ -35,6 +35,15 @@ unsigned long lastWuUpload = 0;
 // ---------- Daily rain reset ----------
 const byte CMD_RESET_RAIN = 0xAA; // must match the Nano's value exactly
 char lastRainResetDate[11] = "";  // "YYYY-MM-DD"
+
+// ---------- Rain (WU only, not exposed on /weather) ----------
+const float RAIN_MM_TO_IN = 0.0393700787f;
+volatile float g_rainDailyMm = 0;
+
+float rainBuckets[60] = {0};     // per-minute rain (mm) for the rolling hour
+uint8_t rainBucketIdx = 0;
+float lastRainDailyMm = 0;
+bool haveRainBaseline = false;
 
 // ---------- Live sensor values (shared with web handler) ----------
 volatile float g_temperature = 0;
@@ -96,6 +105,7 @@ unsigned long wifiDownSince = 0;
 const unsigned long NO_REQUEST_RESTART_MS = 5UL * 60UL * 1000UL; // restart if /weather is not requested for this long
 unsigned long lastWeatherRequest = 0;
 
+// Must match the Nano exactly (9 floats = 36 bytes)
 struct SensorData {
   float temperature;
   float humidity;
@@ -105,6 +115,7 @@ struct SensorData {
   float windDirVaisala;
   float windSpeedSonic;
   float windDirSonic;
+  float rainDailyMm;
 };
 
 bool readSensorDataFromNano(SensorData &out) {
@@ -255,6 +266,54 @@ void resetWUAverages() {
   wuWindDirCount = 0;
 }
 
+// Called once per WU upload (every minute).
+void updateRainForWU(float &rainHourIn, float &rainDailyIn) {
+  float cur = g_rainDailyMm;
+  float delta = 0;
+
+  if (haveRainBaseline) {
+    // If the total dropped (midnight reset or Nano reboot), the new total is all new rain
+    delta = (cur >= lastRainDailyMm) ? (cur - lastRainDailyMm) : cur;
+  }
+  haveRainBaseline = true;
+  lastRainDailyMm = cur;
+
+  rainBuckets[rainBucketIdx] = delta;
+  rainBucketIdx = (rainBucketIdx + 1) % 60;
+
+  float hourMm = 0;
+  for (int i = 0; i < 60; i++) hourMm += rainBuckets[i];
+
+  rainHourIn  = hourMm * RAIN_MM_TO_IN;
+  rainDailyIn = cur * RAIN_MM_TO_IN;
+}
+
+// Sends the reset command to the Nano once per local day.
+void checkDailyRainReset() {
+  time_t now = time(nullptr);
+  if (now < MIN_VALID_TIME) return;   // wait for NTP
+
+  struct tm t;
+  localtime_r(&now, &t);
+  char today[11];
+  strftime(today, sizeof(today), "%Y-%m-%d", &t);
+
+  if (strcmp(today, lastRainResetDate) == 0) return;
+
+  // On first boot just record the date, so a mid-day ESP32 restart doesn't wipe today's rain
+  if (lastRainResetDate[0] != '\0') {
+    Wire.beginTransmission(I2C_ADDR);
+    Wire.write(CMD_RESET_RAIN);
+    if (Wire.endTransmission() != 0) {
+      Serial.println("Rain reset failed, will retry");
+      return;
+    }
+    Serial.println("Daily rain reset sent to Nano");
+  }
+  strncpy(lastRainResetDate, today, sizeof(lastRainResetDate));
+  lastRainResetDate[sizeof(lastRainResetDate) - 1] = '\0';
+}
+
 void uploadToWeatherUnderground() {
   // Snapshot this minute's data and start a fresh collection window.
   const double tempSum = wuTempSum;
@@ -273,6 +332,11 @@ void uploadToWeatherUnderground() {
   const uint16_t windDirCount = wuWindDirCount;
 
   resetWUAverages();
+
+  // Rain: update the rolling hour every minute, even if the upload is skipped
+  float rainHourIn = 0, rainDailyIn = 0;
+  bool haveRain = g_dataValid;
+  if (haveRain) updateRainForWU(rainHourIn, rainDailyIn);
 
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WU upload skipped: WiFi disconnected");
@@ -341,6 +405,11 @@ void uploadToWeatherUnderground() {
   if (haveRadiation)
     url += "&solarradiation=" + String(avgRadiation, 1);
 
+  if (haveRain) {
+    url += "&rainin=" + String(rainHourIn, 3);
+    url += "&dailyrainin=" + String(rainDailyIn, 3);
+  }
+
   url += "&action=updateraw";
   url += "&realtime=1";
   url += "&rtfreq=60";
@@ -365,6 +434,9 @@ void uploadToWeatherUnderground() {
   if (haveWindDir)
     Serial.printf("Average wind direction: %.1f degrees\n", avgWindDir);
 
+  if (haveRain)
+    Serial.printf("Rain: %.3f in last hour, %.3f in today\n", rainHourIn, rainDailyIn);
+
   HTTPClient http;
   http.setConnectTimeout(3000);
   http.setTimeout(5000);
@@ -387,6 +459,7 @@ void uploadToWeatherUnderground() {
   http.end();
 }
 
+// Rain is intentionally NOT included here, so the display never sees it.
 void handleWeather() {
   lastWeatherRequest = millis(); 
   JsonDocument doc;
@@ -423,8 +496,6 @@ void setup() {
 
   Wire.begin();
   Wire.setTimeOut(100);
-
-
 
   WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password);
@@ -506,6 +577,8 @@ void loop() {
   if (millis() - lastRead >= readInterval) {
     lastRead = millis();
 
+    checkDailyRainReset();
+
     digitalWrite(ledPin, HIGH);
 
     SensorData nanoData;
@@ -519,6 +592,8 @@ void loop() {
       g_windDirVaisala   = nanoData.windDirVaisala;
       g_windSpeedSonic   = nanoData.windSpeedSonic;
       g_windDirSonic     = nanoData.windDirSonic;
+
+      g_rainDailyMm = nanoData.rainDailyMm;
 
       float combinedSpeed, combinedDir;
       bool agree;
@@ -552,6 +627,7 @@ void loop() {
     Serial.print("Humidity: "); Serial.print(g_humidity); Serial.println(" %RH");
     Serial.print("Pressure: "); Serial.print(g_pressure); Serial.println(" hPa");
     Serial.print("Solar Radiation: "); Serial.print(g_radiation, 1); Serial.println(" W/m^2");
+    Serial.print("Rain today: "); Serial.print(g_rainDailyMm, 2); Serial.println(" mm");
 
     Serial.print("Vaisala:   "); Serial.print(g_windSpeedVaisala, 2); Serial.print(" m/s @ ");
     Serial.print(g_windDirVaisala, 1); Serial.println(" deg");
@@ -582,7 +658,7 @@ void loop() {
     }
   }
 
-    // Web server backstop: restart if nobody has fetched /weather for a while
+  // Web server backstop: restart if nobody has fetched /weather for a while
   if (millis() - lastWeatherRequest > NO_REQUEST_RESTART_MS) {
     Serial.println("No /weather requests for 5 min, restarting");
     delay(100);

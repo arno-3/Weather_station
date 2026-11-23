@@ -28,6 +28,31 @@ const int windSpeedPin = 2;
 volatile unsigned long pulseCount = 0;
 const float PULSES_PER_HZ_PER_MS = 10.0; // 10 Hz per 1 m/s
 
+// ---------- Rain gauge (tipping bucket, reed switch) ----------
+const int rainPin = 3;                          // reed switch between D3 and GND
+const float RAIN_MM_PER_TIP = 0.1;              // CHANGE to match your bucket
+const unsigned long RAIN_DEBOUNCE_MS = 100;
+const byte CMD_RESET_RAIN = 0xAA;               // must match the ESP32
+
+volatile uint32_t rainTips = 0;
+volatile unsigned long lastRainTipMs = 0;
+volatile bool rainResetRequested = false;
+
+void rainISR() {
+  unsigned long now = millis();
+  if (now - lastRainTipMs >= RAIN_DEBOUNCE_MS) {
+    rainTips++;
+    lastRainTipMs = now;
+  }
+}
+
+void receiveEvent(int numBytes) {
+  while (Wire.available()) {
+    byte c = Wire.read();
+    if (c == CMD_RESET_RAIN) rainResetRequested = true;
+  }
+}
+
 // Both sensors are mounted with their north marker pointing south
 const float VAISALA_DIR_OFFSET   = 180.0;
 const float WINDSONIC_DIR_OFFSET = 180.0;
@@ -117,7 +142,7 @@ void readWindSonic() {
   }
 }
 
-// ---------- Shared struct, MUST match the ESP32 exactly (8 floats) ----------
+// ---------- Shared struct, MUST match the ESP32 exactly (9 floats) ----------
 struct SensorData {
   float temperature;
   float humidity;
@@ -127,10 +152,11 @@ struct SensorData {
   float windDirVaisala;
   float windSpeedSonic;
   float windDirSonic;
+  float rainDailyMm;
 };
 
 // Only written inside noInterrupts(), so requestEvent() always sees a complete set
-SensorData sharedData = {0, 0, 0, 0, 0, 0, 0, 0};
+SensorData sharedData = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 // ---------- Helpers ----------
 float readVoltage(int pin) {
@@ -167,8 +193,13 @@ void setup() {
     pinMode(dirPins[i], INPUT);
   }
 
+  // Rain gauge reed switch
+  pinMode(rainPin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(rainPin), rainISR, FALLING);
+
   Wire.begin(I2C_ADDR);
   Wire.onRequest(requestEvent);
+  Wire.onReceive(receiveEvent);
 
   noInterrupts();
   pulseCount = 0;
@@ -190,6 +221,15 @@ void loop() {
   }
   nextLoopMs += LOOP_PERIOD_MS;
   Watchdog.reset();
+
+  // Daily rain reset requested by the ESP32 at local midnight
+  if (rainResetRequested) {
+    noInterrupts();
+    rainTips = 0;
+    rainResetRequested = false;
+    interrupts();
+    Serial.println("Daily rain reset");
+  }
 
   digitalWrite(ledPin, HIGH);
   readWindSonic();
@@ -219,6 +259,12 @@ void loop() {
   data.windSpeedSonic = windSonicSpeed;
   data.windDirSonic   = windSonicDirection;
 
+  // Rain: daily total from tip count
+  noInterrupts();
+  uint32_t tipsSnapshot = rainTips;
+  interrupts();
+  data.rainDailyMm = tipsSnapshot * RAIN_MM_PER_TIP;
+
   // Publish the complete set in one atomic copy
   noInterrupts();
   sharedData = data;
@@ -229,6 +275,7 @@ void loop() {
   Serial.print("Humidity: "); Serial.print(data.humidity); Serial.println(" %RH");
   Serial.print("Pressure: "); Serial.print(data.pressure); Serial.println(" hPa");
   Serial.print("Solar Radiation: "); Serial.print(data.radiation, 1); Serial.println(" W/m^2");
+  Serial.print("Rain today: "); Serial.print(data.rainDailyMm, 2); Serial.println(" mm");
 
   Serial.println("-- Wind comparison --");
   Serial.print("Vaisala:   "); Serial.print(data.windSpeedVaisala, 2); Serial.print(" m/s @ ");
