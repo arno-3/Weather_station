@@ -11,8 +11,8 @@
 #include <ArduinoOTA.h>
 
 // ---------- WiFi ----------
-const char* ssid = "dlink-6D5C";
-const char* password = "cuwqs53732";
+const char* ssid = "Macmini";
+const char* password = "Leeza=098";
 
 WebServer server(80);
 
